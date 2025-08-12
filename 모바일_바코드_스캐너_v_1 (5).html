@@ -1,0 +1,209 @@
+<!-- index.html (rear autopick + stability + result reset + confidence filter + reader select) -->
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <title>모바일 바코드 스캐너</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <style>
+    body { font-family: system-ui, sans-serif; text-align: center; margin:0; padding:16px; }
+    h1 { margin: 8px 0; font-size: 1.4rem; }
+    p.hint { color: #666; font-size: 0.95rem; margin-bottom:12px; }
+    #controls { margin:12px 0; display:flex; gap:8px; justify-content:center; flex-wrap:wrap; }
+    select, button { padding:10px 14px; border-radius:10px; border:1px solid #ccc; font-weight:600; }
+    button.primary { background:#0ea5e9; border:0; color:#fff; }
+    #interactive.viewport { position:relative; width:100%; max-width:720px; margin:0 auto; border-radius:12px; overflow:hidden; background:#000; aspect-ratio:16/9; }
+    #interactive video, #interactive canvas { width:100%; height:100%; object-fit:cover; }
+    .guide { position:absolute; inset:22% 12%; border:2px solid rgba(16,185,129,.9); box-shadow:0 0 0 9999px rgba(0,0,0,.35) inset; border-radius:10px; pointer-events:none; }
+    #result { margin-top:12px; font-size:1.05rem; }
+    .success { color:#16a34a; font-weight:700; }
+    .error { color:#dc2626; font-weight:700; }
+    .small { font-size:.9rem; color:#666; }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/quagga/dist/quagga.min.js"></script>
+</head>
+<body>
+  <h1>모바일 바코드 스캐너</h1>
+  <p class="hint">HTTPS 환경에서 권한 허용 후 사용하세요. (후면 자동선택 · 안정화 · 정확도 필터)</p>
+
+  <div id="controls">
+    <select id="readerSelect" aria-label="바코드 타입">
+      <option value="auto" selected>자동(권장)</option>
+      <option value="ean">EAN-13/8</option>
+      <option value="code128">Code 128</option>
+      <option value="code39">Code 39</option>
+      <option value="upc">UPC / UPC-E</option>
+    </select>
+    <select id="cameraSelect" aria-label="카메라 선택"></select>
+    <button id="btn-start" class="primary">스캔 시작</button>
+    <button id="btn-stop" disabled>스캔 중지</button>
+  </div>
+
+  <div id="interactive" class="viewport">
+    <div class="guide" aria-hidden="true"></div>
+  </div>
+
+  <div id="result">
+    <p>스캔 결과: <span id="barcode-value">...</span></p>
+    <p id="status" class="small"></p>
+  </div>
+
+  <script>
+    const el = {
+      start: document.getElementById('btn-start'),
+      stop: document.getElementById('btn-stop'),
+      value: document.getElementById('barcode-value'),
+      status: document.getElementById('status'),
+      camSel: document.getElementById('cameraSelect'),
+      readerSel: document.getElementById('readerSelect')
+    };
+    let lastCode=null, lastTime=0, handlersBound=false;
+    const DUP_MS=1500;
+
+    // 안정화 파라미터
+    const CONSISTENT_HITS_REQUIRED = 3;  // 동일 코드 3회 이상
+    const CONSISTENT_WINDOW_MS = 1200;   // 1.2초 내
+    const hitBuffer = new Map();         // code -> {count, firstTs}
+    const MAX_AVG_ERROR = 0.15;          // 평균 에러 임계값(Quagga의 decodedCodes 기반)
+
+    function setStatus(msg,type=''){ el.status.textContent=msg||''; el.status.className='small '+(type||''); }
+    function ensurePlaysInline(){
+      const v=document.querySelector('#interactive video');
+      if(v){ v.setAttribute('playsinline',''); v.setAttribute('webkit-playsinline',''); v.removeAttribute('autoplay'); }
+    }
+
+    function autoSelectBack(cams){
+      if (!cams || cams.length===0) return;
+      const back = cams.find(d => /back|rear|environment|후면|뒤/i.test(d.label||''));
+      if (back) { el.camSel.value = back.deviceId || ''; return; }
+      if (!el.camSel.value && cams.length===2) el.camSel.value = cams[1].deviceId || '';
+    }
+
+    async function populateDevices(){
+      try{
+        try{ const s=await navigator.mediaDevices.getUserMedia({ video:{ facingMode: { ideal: 'environment' } }, audio:false }); s.getTracks().forEach(t=>t.stop()); }catch(_){ }
+        const list=await navigator.mediaDevices.enumerateDevices();
+        const cams=list.filter(d=>d.kind==='videoinput');
+        el.camSel.innerHTML='';
+        cams.forEach((d,i)=>{ const opt=document.createElement('option'); opt.value=d.deviceId||''; opt.textContent=d.label||`카메라 ${i+1}`; el.camSel.appendChild(opt); });
+        autoSelectBack(cams);
+      }catch(e){ }
+    }
+
+    function buildConstraints(){
+      const id=el.camSel.value;
+      if (id) return { deviceId:{ exact:id }, width:{ ideal:1280 }, height:{ ideal:720 }, aspectRatio:{ ideal:16/9 } };
+      return { facingMode:{ ideal:'environment' }, width:{ ideal:1280 }, height:{ ideal:720 }, aspectRatio:{ ideal:16/9 } };
+    }
+
+    function readersFromChoice(){
+      switch(el.readerSel.value){
+        case 'ean': return ['ean_reader','ean_8_reader'];
+        case 'code128': return ['code_128_reader'];
+        case 'code39': return ['code_39_reader'];
+        case 'upc': return ['upc_reader','upc_e_reader'];
+        default: return ['ean_reader','ean_8_reader','upc_reader','upc_e_reader','code_128_reader','code_39_reader','code_93_reader'];
+      }
+    }
+
+    function drawOverlays(result){
+      const ctx = Quagga.canvas?.ctx?.overlay, cvs = Quagga.canvas?.dom?.overlay;
+      if(!ctx||!cvs) return;
+      ctx.clearRect(0,0,cvs.width,cvs.height);
+      if(result?.boxes){
+        result.boxes.filter(b=>b!==result.box).forEach(box=>{
+          ctx.beginPath(); ctx.strokeStyle='rgba(255,255,255,0.35)'; ctx.lineWidth=2;
+          ctx.moveTo(box[0].x,box[0].y); for(let i=1;i<box.length;i++) ctx.lineTo(box[i].x,box[i].y);
+          ctx.closePath(); ctx.stroke();
+        });
+      }
+      if(result?.box){
+        ctx.beginPath(); ctx.strokeStyle='rgba(16,185,129,0.9)'; ctx.lineWidth=3;
+        ctx.moveTo(result.box[0].x,result.box[0].y); for(let i=1;i<result.box.length;i++) ctx.lineTo(result.box[i].x,result.box[i].y);
+        ctx.closePath(); ctx.stroke();
+      }
+    }
+
+    function resetResult(){ el.value.textContent='...'; el.value.classList.remove('success'); }
+
+    function avgError(decoded){
+      if (!Array.isArray(decoded)) return 1;
+      const errs = decoded.map(d=>typeof d.error==='number'?Math.abs(d.error):NaN).filter(x=>!isNaN(x));
+      if (!errs.length) return 1;
+      return errs.reduce((a,b)=>a+b,0)/errs.length;
+    }
+
+    function bindQuagga(){
+      if(handlersBound)return; handlersBound=true;
+      Quagga.onProcessed(drawOverlays);
+      Quagga.onDetected(r=>{
+        const code=r?.codeResult?.code; if(!code) return;
+        // 1) 정확도(평균 에러) 필터
+        const aerr = avgError(r?.codeResult?.decodedCodes);
+        if (aerr > MAX_AVG_ERROR) return; // 신뢰도 낮으면 무시
+
+        // 2) 시간·중복 안정화
+        const now = Date.now();
+        const entry = hitBuffer.get(code) || { count:0, firstTs: now };
+        if (now - entry.firstTs > CONSISTENT_WINDOW_MS) { entry.count = 0; entry.firstTs = now; }
+        entry.count += 1; hitBuffer.set(code, entry);
+        if (entry.count >= CONSISTENT_HITS_REQUIRED) {
+          if (code===lastCode && (now-lastTime)<DUP_MS) return;
+          lastCode=code; lastTime=now;
+          el.value.textContent = code; el.value.classList.add('success');
+          setStatus(`스캔 성공! (avgErr: ${aerr.toFixed(3)})`);
+          if (navigator.vibrate) navigator.vibrate(60);
+          hitBuffer.clear();
+        }
+      });
+    }
+
+    function initQuagga(constraints){
+      return new Promise(res=>{
+        Quagga.init({
+          inputStream:{
+            name:'Live', type:'LiveStream', target:document.getElementById('interactive'), constraints,
+            // ROI를 조금 더 타이트하게 — 배경 노이즈 감소
+            area:{ top:'22%', right:'12%', left:'12%', bottom:'22%' }
+          },
+          locator:{ patchSize:'small', halfSample:false },
+          numOfWorkers: (typeof navigator.hardwareConcurrency==='number') ? Math.max(2, Math.min(4, navigator.hardwareConcurrency-1)) : 2,
+          frequency: 15,
+          decoder:{ readers: readersFromChoice() },
+          locate:true
+        }, err=>res({err}));
+      });
+    }
+
+    async function startScanner(){
+      resetResult(); hitBuffer.clear();
+      el.start.disabled=true; el.stop.disabled=false; setStatus('카메라 초기화 중...');
+      await populateDevices(); bindQuagga();
+      const {err}=await initQuagga(buildConstraints());
+      if(!err){ setStatus('카메라 시작됨. 바코드를 가이드 중앙에 맞춰 천천히 이동하세요.'); Quagga.start(); setTimeout(ensurePlaysInline,50); }
+      else {
+        try{
+          await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } } });
+          const {err:err2}=await initQuagga({ facingMode:{ ideal:'environment' } });
+          if(!err2){ setStatus('카메라 시작됨(대체 설정).'); Quagga.start(); setTimeout(ensurePlaysInline,50); return; }
+        }catch(_){ }
+        setStatus('카메라를 시작할 수 없습니다. 권한/HTTPS/브라우저를 확인하세요.','error'); el.start.disabled=false; el.stop.disabled=true;
+      }
+    }
+
+    function stopScanner(){
+      try{ Quagga.stop(); }catch(_){}
+      el.start.disabled=false; el.stop.disabled=true;
+      setStatus('스캔 중지됨');
+      hitBuffer.clear();
+      resetResult();
+    }
+
+    el.start.addEventListener('click',startScanner);
+    el.stop.addEventListener('click',stopScanner);
+    el.camSel.addEventListener('change',()=>{ if (!el.stop.disabled) { stopScanner(); setStatus('선택한 카메라로 다시 시작을 눌러 주세요.'); } });
+    el.readerSel.addEventListener('change',()=>{ if (!el.stop.disabled) { stopScanner(); setStatus('선택한 바코드 타입으로 다시 시작을 눌러 주세요.'); } });
+    document.addEventListener('visibilitychange',()=>{ if(document.hidden && !el.stop.disabled) stopScanner(); });
+  </script>
+</body>
+</html>
