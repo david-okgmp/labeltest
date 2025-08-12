@@ -1,0 +1,122 @@
+📂 프로젝트 구조 (GitHub Pages용)
+
+```
+📦 barcode-scanner
+ ┣ 📜 index.html       ← 메인 페이지 (바코드 스캐너)
+ ┗ 📜 README.md        ← 프로젝트 설명
+```
+```
+<!-- index.html -->
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <title>모바일 바코드 스캐너</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: system-ui, sans-serif; text-align: center; margin:0; padding:16px; }
+    h1 { margin: 8px 0; font-size: 1.4rem; }
+    p.hint { color: #666; font-size: 0.95rem; margin-bottom:12px; }
+    #controls { margin:12px 0; display:flex; gap:8px; justify-content:center; flex-wrap:wrap; }
+    select, button { padding:10px 14px; border-radius:10px; border:1px solid #ccc; font-weight:600; }
+    button.primary { background:#0ea5e9; border:0; color:#fff; }
+    #interactive.viewport { position:relative; width:100%; max-width:720px; margin:0 auto; border-radius:12px; overflow:hidden; background:#000; aspect-ratio:16/9; }
+    #interactive video, #interactive canvas { width:100%; height:100%; object-fit:cover; }
+    .guide { position:absolute; inset:20% 10%; border:2px solid rgba(16,185,129,.9); box-shadow:0 0 0 9999px rgba(0,0,0,.35) inset; border-radius:10px; pointer-events:none; }
+    #result { margin-top:12px; font-size:1.05rem; }
+    .success { color:#16a34a; font-weight:700; }
+    .error { color:#dc2626; font-weight:700; }
+    .small { font-size:.9rem; color:#666; }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/quagga/dist/quagga.min.js"></script>
+</head>
+<body>
+  <h1>모바일 바코드 스캐너</h1>
+  <p class="hint">HTTPS 환경에서 권한 허용 후 사용하세요.</p>
+
+  <div id="controls">
+    <select id="cameraSelect"></select>
+    <button id="btn-start" class="primary">스캔 시작</button>
+    <button id="btn-stop" disabled>스캔 중지</button>
+  </div>
+
+  <div id="interactive" class="viewport">
+    <div class="guide"></div>
+  </div>
+
+  <div id="result">
+    <p>스캔 결과: <span id="barcode-value">...</span></p>
+    <p id="status" class="small"></p>
+  </div>
+
+  <script>
+    const el = {
+      start: document.getElementById('btn-start'),
+      stop: document.getElementById('btn-stop'),
+      value: document.getElementById('barcode-value'),
+      status: document.getElementById('status'),
+      camSel: document.getElementById('cameraSelect')
+    };
+    let lastCode=null, lastTime=0, handlersBound=false;
+    const DUP_MS=1500;
+
+    function setStatus(msg,type=''){ el.status.textContent=msg||''; el.status.className='small '+(type||''); }
+    function ensurePlaysInline(){
+      const v=document.querySelector('#interactive video');
+      if(v){ v.setAttribute('playsinline',''); v.setAttribute('webkit-playsinline',''); v.removeAttribute('autoplay'); }
+    }
+    async function populateDevices(){
+      try{
+        try{ const s=await navigator.mediaDevices.getUserMedia({ video:{ facingMode: { ideal: 'environment' } } }); s.getTracks().forEach(t=>t.stop()); }catch(_){ }
+        const list=await navigator.mediaDevices.enumerateDevices();
+        const cams=list.filter(d=>d.kind==='videoinput');
+        el.camSel.innerHTML='';
+        cams.forEach((d,i)=>{ const opt=document.createElement('option'); opt.value=d.deviceId; opt.textContent=d.label||`카메라 ${i+1}`; el.camSel.appendChild(opt); });
+      }catch(e){}
+    }
+    function buildConstraints(){
+      const id=el.camSel.value;
+      return id?{deviceId:{exact:id},width:{ideal:1280},height:{ideal:720}}:{facingMode:{exact:'environment'},width:{ideal:1280},height:{ideal:720}};
+    }
+    function bindQuagga(){
+      if(handlersBound)return; handlersBound=true;
+      Quagga.onDetected(r=>{
+        const code=r?.codeResult?.code; if(!code)return;
+        const now=Date.now(); if(code===lastCode && (now-lastTime)<DUP_MS)return;
+        lastCode=code; lastTime=now; el.value.textContent=code; el.value.classList.add('success'); setStatus('스캔 성공!');
+      });
+    }
+    function initQuagga(constraints){
+      return new Promise(res=>{
+        Quagga.init({ inputStream:{ name:'Live', type:'LiveStream', target:document.getElementById('interactive'), constraints }, locator:{ patchSize:'medium', halfSample:true }, decoder:{ readers:['ean_reader','ean_8_reader','code_39_reader','code_128_reader'] }, locate:true }, err=>res({err}));
+      });
+    }
+    async function startScanner(){
+      el.start.disabled=true; el.stop.disabled=false; setStatus('카메라 초기화 중...');
+      await populateDevices(); bindQuagga();
+      const {err}=await initQuagga(buildConstraints());
+      if(!err){ setStatus('카메라 시작됨. 바코드를 맞춰주세요.'); Quagga.start(); setTimeout(ensurePlaysInline,50); }
+      else { setStatus('카메라를 시작할 수 없습니다. 권한/HTTPS 확인','error'); el.start.disabled=false; el.stop.disabled=true; }
+    }
+    function stopScanner(){ try{ Quagga.stop(); }catch(_){} el.start.disabled=false; el.stop.disabled=true; setStatus('스캔 중지됨'); }
+    el.start.addEventListener('click',startScanner);
+    el.stop.addEventListener('click',stopScanner);
+    document.addEventListener('visibilitychange',()=>{ if(document.hidden && !el.stop.disabled) stopScanner(); });
+  </script>
+</body>
+</html>
+```
+
+```
+<!-- README.md -->
+# 모바일 바코드 스캐너
+
+모바일 환경에서 동작하는 웹 기반 바코드 스캐너입니다.
+
+## 사용 방법
+1. 이 리포지토리를 GitHub에 업로드합니다.
+2. GitHub Pages를 활성화합니다.
+3. 발급된 `https://사용자명.github.io/리포명/` 주소를 모바일 브라우저에서 엽니다.
+4. **카메라 권한을 허용**하고 바코드를 스캔합니다.
+```
