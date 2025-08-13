@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <title>모바일 바코드/QR 스캐너</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <style>
+    body { font-family: system-ui, sans-serif; text-align: center; margin:0; padding:16px; }
+    h1 { margin: 8px 0; font-size: 1.4rem; }
+    p.hint { color: #666; font-size: 0.95rem; margin-bottom:12px; }
+    #controls { margin:12px 0; display:flex; gap:8px; justify-content:center; flex-wrap:wrap; }
+    select, button { padding:10px 14px; border-radius:10px; border:1px solid #ccc; font-weight:600; }
+    button.primary { background:#0ea5e9; border:0; color:#fff; }
+    #interactive.viewport { position:relative; width:100%; max-width:720px; margin:0 auto; border-radius:12px; overflow:hidden; background:#000; aspect-ratio:16/9; }
+    #interactive video { width:100%; height:100%; object-fit:cover; }
+    .guide { position:absolute; inset:20% 10%; border:2px solid rgba(16,185,129,.9); box-shadow:0 0 0 9999px rgba(0,0,0,.35) inset; border-radius:10px; pointer-events:none; }
+    #result { margin-top:12px; font-size:1.05rem; }
+    .success { color:#16a34a; font-weight:700; }
+    .error { color:#dc2626; font-weight:700; }
+    .small { font-size:.9rem; color:#666; }
+  </style>
+  <script src="https://unpkg.com/@zxing/library@0.21.2"></script>
+</head>
+<body>
+  <h1>모바일 바코드/QR 스캐너</h1>
+  <p class="hint">HTTPS 환경에서 권한 허용 후 사용하세요. (QR 포함 · 후면 카메라 자동 선택)</p>
+  <div id="controls">
+    <select id="formatSelect" aria-label="인식 포맷">
+      <option value="auto" selected>자동 (QR + 1D)</option>
+      <option value="qr">QR 코드만</option>
+      <option value="ean">EAN-13/8</option>
+      <option value="code128">Code 128</option>
+      <option value="code39">Code 39</option>
+      <option value="upc">UPC / UPC-E</option>
+    </select>
+    <select id="cameraSelect" aria-label="카메라 선택"></select>
+    <button id="btn-start" class="primary">스캔 시작</button>
+    <button id="btn-stop" disabled>스캔 중지</button>
+  </div>
+  <div id="interactive" class="viewport">
+    <video id="video" muted playsinline webkit-playsinline></video>
+    <div class="guide"></div>
+  </div>
+  <div id="result">
+    <p>스캔 결과: <span id="barcode-value">...</span></p>
+    <p id="status" class="small"></p>
+  </div>
+  <script>
+    const el = {
+      start: document.getElementById('btn-start'),
+      stop: document.getElementById('btn-stop'),
+      value: document.getElementById('barcode-value'),
+      status: document.getElementById('status'),
+      video: document.getElementById('video')
+    };
+
+    let codeReader = null;
+    let lastCode = null, stableCount = 0;
+
+    function setStatus(msg, type=''){ el.status.textContent = msg; el.status.className = 'small ' + type; }
+    function resetResult(){ el.value.textContent = '...'; el.value.classList.remove('success'); lastCode = null; stableCount = 0; }
+
+    function isSecure(){ return window.isSecureContext || location.protocol === 'https:' || ['localhost','127.0.0.1'].includes(location.hostname); }
+
+    async function startScanner(){
+      resetResult(); setStatus('카메라 초기화 중...');
+      el.start.disabled = true; el.stop.disabled = false;
+
+      if (!isSecure()) {
+        setStatus('HTTPS가 아닙니다. 모바일 브라우저는 카메라 접근을 차단합니다. https:// 로 접속하세요.','error');
+        el.start.disabled=false; el.stop.disabled=true; return;
+      }
+
+      // 장치 목록 (실패해도 계속 진행하여 facingMode로 시도)
+      try {
+        await populateDevices();
+      } catch(e){
+        console.warn('장치 조회 실패:', e?.message||e);
+        setStatus('장치 목록을 가져오지 못하여 기본 후면 카메라로 시도합니다. ('+(e?.message||e?.name||'')+')');
+        selectedDeviceId = null; // deviceId 사용 포기
+      }
+
+      const ZX = ZXing;
+      codeReader = new ZX.BrowserMultiFormatReader(buildHints(), 200);
+
+      // 단계적 constraints 시도
+      const tries = constraintsList();
+      let started = false; let lastError = null;
+      for (const c of tries) {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia(c);
+          el.video.srcObject = stream; await el.video.play().catch(()=>{});
+          await codeReader.decodeFromConstraints(c, el.video, (result, err)=>{
+            if (result) {
+              const text = result.getText();
+              if (text === lastCode) { stableCount++; } else { stableCount = 1; lastCode = text; }
+              const now = Date.now(); if (text === lastCode && (now-lastTime)<DUP_MS) return;
+              lastTime = now;
+              if (stableCount >= STABLE_N) {
+                el.value.textContent = text; el.value.classList.add('success');
+                setStatus(`스캔 성공 (${result.getBarcodeFormat()})`);
+                if (navigator.vibrate) navigator.vibrate(60);
+              }
+            }
+          });
+          started = true; break;
+        } catch(e){
+          lastError = e;
+          try { const st = el.video.srcObject; if (st) { st.getTracks().forEach(t=>t.stop()); el.video.srcObject=null; } } catch(_){ }
+          continue;
+        }
+      }
+
+      if (!started) {
+        const name = lastError?.name || '오류';
+        setStatus('카메라 열기 실패: '+name+' — 권한 차단/다른 앱 점유/인앱 브라우저 여부/HTTPS를 확인하세요.','error');
+        el.start.disabled=false; el.stop.disabled=true;
+      } else {
+        setStatus('카메라 시작됨. 바코드를 가이드 중앙에 맞춰 천천히 이동하세요.');
+      }
+    }
+
+      try {
+        await navigator.mediaDevices.getUserMedia({ video: true });
+        const devices = await ZXing.BrowserMultiFormatReader.listVideoInputDevices();
+        const backCam = devices.find(d => /back|rear|environment|후면|뒤/i.test(d.label)) || devices[0];
+        const constraints = { video: { deviceId: backCam.deviceId ? { exact: backCam.deviceId } : undefined } };
+        codeReader = new ZXing.BrowserMultiFormatReader();
+        await codeReader.decodeFromConstraints(constraints, el.video, (result, err) => {
+          if (result) {
+            const text = result.getText();
+            if (text === lastCode) {
+              stableCount++;
+              if (stableCount >= 2) {
+                el.value.textContent = text;
+                el.value.classList.add('success');
+                setStatus(`스캔 성공 (${result.getBarcodeFormat()})`);
+              }
+            } else {
+              lastCode = text;
+              stableCount = 1;
+            }
+          }
+        });
+        setStatus('카메라 시작됨. 바코드를 중앙에 맞춰주세요.');
+      } catch (e) {
+        console.error(e);
+        setStatus('카메라 장치 조회 실패: 권한/브라우저 설정 확인', 'error');
+        el.start.disabled = false; el.stop.disabled = true;
+      }
+    }
+
+    function stopScanner(){
+      if (codeReader) codeReader.reset();
+      const stream = el.video.srcObject;
+      if (stream) stream.getTracks().forEach(t => t.stop());
+      resetResult();
+      el.start.disabled = false; el.stop.disabled = true;
+      setStatus('스캔 중지됨');
+    }
+
+    el.start.addEventListener('click', startScanner);
+    el.stop.addEventListener('click', stopScanner);
+  </script>
+</body>
+</html>
